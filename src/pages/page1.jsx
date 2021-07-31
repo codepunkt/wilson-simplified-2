@@ -1,6 +1,7 @@
-const Page1 = ({ contentPages, frontmatter }) => (
+export const Page = ({ contentPages, frontmatter }) => (
   <>
     <h1>{frontmatter.title}</h1>
+    <pre>{JSON.stringify(frontmatter, null, 2)}</pre>
     {contentPages && (
       <ul>
         {contentPages.map((cp) => (
@@ -10,8 +11,6 @@ const Page1 = ({ contentPages, frontmatter }) => (
     )}
   </>
 )
-
-export default Page1
 
 export const frontmatter = {
   title: 'Page 1',

@@ -51,34 +51,22 @@ export default defineConfig({
         const code = `
           import { h } from 'preact';
           import { lazy } from 'preact-iso';
-          const Page2 = lazy(() => import('page:./src/pages/page2.md'));
-          const Page3 = lazy(() => import('page:./src/pages/page3.md'));
-          const Page1 = lazy(() => import('page:./src/pages/page1?selectedTerm=foo&page=1'));
+          const Page2 = lazy(() => import('./src/pages/page2.md'));
+          const Page3 = lazy(() => import('./src/pages/page3.md'));
+          const Page1 = lazy(() => import('./src/pages/page1?page=1'));
           export default [h(Page1,{path:'/page1'}),h(Page2,{path:'/page2'}),h(Page3,{path:'/page3'})];
         `
         return code
       },
     },
-    {
-      name: 'pages',
-      async resolveId(id, importer) {
-        if (id.startsWith(pageSchema)) {
-          const plainId = id.slice(pageSchema.length)
-          const result = await this.resolve(plainId, importer)
-          if (!result) return
-          const extension = path.extname(result.id.split('?')[0])
-          return `${extension.replace(/^\./, '')}-page:` + result.id
-        }
-      },
-    },
     // has to be before 'pages' plugin
     {
       name: 'md-pages',
-      resolveId(id) {
-        if (id.startsWith(mdPageSchema)) {
-          return id.slice(mdPageSchema.length)
-        }
-      },
+      // resolveId(id) {
+      //   if (isPage(id) === '.md') {
+      //     return id
+      //   }
+      // },
       transform(code, id) {
         if (isPage(id) === '.md') {
           const { content } = grayMatter(code)
@@ -103,53 +91,32 @@ export default defineConfig({
     },
     {
       name: 'js-pages',
-      resolveId(id) {
-        if (id.startsWith(jsxPageSchema)) {
-          return id.slice(jsxPageSchema.length)
-        }
-      },
-      load(id) {
+      // resolveId(id) {
+      //   if (isPage(id) === '.jsx') {
+      //     return id
+      //   }
+      // },
+      transform(code, id) {
         if (isPage(id) === '.jsx') {
           const [file, queryString] = id.split('?')
-          if (!queryString) return
           // const query = parseQueryString(queryString)
           const frontmatter = frontmatterCache.get(file)
-          const props = {
-            frontmatter,
-            // ...(frontmatter.type === 'select'
-            //   ? {
-            //       contentPages: Array.from(frontmatterCache.entries())
-            //         .map(([key, value]) => {
-            //           if (
-            //             (typeof value.type === 'undefined' ||
-            //               value.type === 'content') &&
-            //             typeof value.taxonomies !== 'undefined' &&
-            //             typeof value.taxonomies[frontmatter.taxonomyName] !==
-            //               'undefined'
-            //           ) {
-            //             let included = false
-            //             for (const term of frontmatter.selectedTerms) {
-            //               if (
-            //                 value.taxonomies[frontmatter.taxonomyName].includes(
-            //                   term
-            //                 )
-            //               ) {
-            //                 included = true
-            //               }
-            //             }
-            //             if (included) {
-            //               return [key, value]
-            //             }
-            //           }
-            //           return false
-            //         })
-            //         .filter(Boolean),
-            // }
-            // : {}),
+          const props = { frontmatter }
+          const preact = transform(
+            `${code}const props=${JSON.stringify(props)};${wrapLayout(
+              `<Page {...props} />`
+            )}`,
+            {
+              transforms: ['jsx'],
+              production: true,
+              jsxPragma: 'h',
+              jsxFragmentPragma: 'Fragment',
+            }
+          ).code
+          console.log({ preact })
+          return {
+            code: preact,
           }
-          return `import Page from '${file}';const props=${JSON.stringify(
-            props
-          )};${wrapLayout(`<Page {...props} />`)}`
         }
       },
     },
