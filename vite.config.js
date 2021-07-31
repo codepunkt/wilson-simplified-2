@@ -32,6 +32,14 @@ const wrapLayout = (wrapped, layoutProps = {}) => {
   )}}>${wrapped}</Layout>;export default Wrapper;`
 }
 
+const pagePathToRoute = (pagePath) => {
+  const relativePath = path.relative(pageDirectory, pagePath)
+  const extensionRegexp = new RegExp(`(${pageExtensions.join('|')})$`)
+  const withoutExtension = relativePath.replace(extensionRegexp, '')
+  const withoutIndex = withoutExtension.replace(/\/index$/, '')
+  return `/${withoutIndex}/`
+}
+
 const parseFrontmatter = (code, extension) => {
   if (extension === '.md') {
     const { data } = grayMatter(code)
@@ -94,13 +102,19 @@ export default defineConfig({
       },
       async load(id) {
         if (!id.startsWith('virtual:routes')) return
+        const pageFiles = klawSync(pageDirectory, { nodir: true })
+        let lazyPages = ''
+        let routes = []
+        pageFiles.forEach(({ path: pagePath }, i) => {
+          // @todo add pagination to pagePath import
+          lazyPages += `const Page${i} = lazy(() => import('${pagePath}'));`
+          routes.push(`h(Page${i},{path:'${pagePathToRoute(pagePath)}'})`)
+        })
         const code = `
           import { h } from 'preact';
           import { lazy } from 'preact-iso';
-          const Page2 = lazy(() => import('./src/pages/page2.md'));
-          const Page3 = lazy(() => import('./src/pages/page3.md'));
-          const Page1 = lazy(() => import('./src/pages/page1?page=1'));
-          export default [h(Page1,{path:'/page1'}),h(Page2,{path:'/page2'}),h(Page3,{path:'/page3'})];
+          ${lazyPages}
+          export default [${routes.join(',')}];
         `
         return code
       },
