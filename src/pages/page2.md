@@ -1,7 +1,7 @@
 ---
 title: Documentation
 taxonomies:
-  category:
+  categories:
     - writing
 ---
 

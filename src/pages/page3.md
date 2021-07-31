@@ -1,7 +1,7 @@
 ---
 title: Waaaaaat!?
 taxonomies:
-  category:
+  categories:
     - writing
 ---
 
