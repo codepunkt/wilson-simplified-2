@@ -21,6 +21,7 @@
     "preact-render-to-string": "5.1.19",
     "qs": "6.10.1",
     "react": "17.0.2",
+    "slugify": "^1.6.0",
     "sucrase": "3.20.0"
   },
   "devDependencies": {
