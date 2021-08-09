@@ -6,6 +6,7 @@ taxonomies:
   tags:
     - JavaScript
     - TypeScript
+    - JAMstack
 ---
 
 # TypeScript

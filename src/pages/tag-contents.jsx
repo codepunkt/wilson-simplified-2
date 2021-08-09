@@ -20,6 +20,6 @@ export const Page = ({ frontmatter, pages, pagination }) => {
 export const frontmatter = {
   type: 'taxonomy',
   taxonomyName: 'tags',
-  title: 'Tag: ${term}',
-  permalink: '/tag/${term}/',
+  title: 'Tag: [term]',
+  permalink: '/tag/[term]/',
 }

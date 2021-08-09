@@ -1,4 +1,11 @@
-const PageLayout = ({ children, frontmatter, pages, pagination, terms }) => {
+const PageLayout = ({
+  children,
+  frontmatter,
+  pages,
+  pagination,
+  selectedTerm,
+  terms,
+}) => {
   return (
     <>
       <nav>
@@ -20,6 +27,7 @@ const PageLayout = ({ children, frontmatter, pages, pagination, terms }) => {
         <pre>
           frontmatter = {JSON.stringify(frontmatter, null, 2)}
           {terms && `\n\nterms = ${JSON.stringify(terms, null, 2)}`}
+          {selectedTerm && `\n\nselectedTerm = ${selectedTerm}`}
           {pagination &&
             `\n\npagination = ${JSON.stringify(pagination, null, 2)}`}
         </pre>

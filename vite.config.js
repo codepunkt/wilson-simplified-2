@@ -1,26 +1,36 @@
+import fs from 'fs'
+import path from 'path'
+import { createRequire } from 'module'
+
 import { defineConfig } from 'vite'
 import preact from '@preact/preset-vite'
 import grayMatter from 'gray-matter'
 import MarkdownIt from 'markdown-it'
 import { transform } from 'sucrase'
-import path from 'path'
-import fs from 'fs'
+import Debug from 'debug'
 import { walk } from 'estree-walker'
-import { parse as parseQueryString, stringify as stringifyQuery } from 'qs'
+import { stringify as stringifyQuery } from 'qs'
 import { parse as parseJavaScript } from 'acorn'
 import { generate } from 'astring'
-import klawSync from 'klaw-sync'
 import slugify from 'slugify'
+import fg from 'fast-glob'
+
+const PAGE_EXTENSIONS = ['.jsx', '.md']
+const PAGINATION_PAGE_SIZE = 2
+const MODULE_ID_VIRTUAL = 'virtual:routes'
 
 const md = new MarkdownIt()
-
-const frontmatterCache = new Map()
 const hotUpdateCache = new Map()
 const contentPagesCache = new Map()
-const pageExtensions = ['.jsx', '.md']
 const pageDirectory = path.join(process.cwd(), 'src', 'pages')
 const layoutPath = path.join(process.cwd(), 'src', 'layouts', 'page.jsx')
-const pageSize = 2
+
+const debug = {
+  hmr: Debug('wilson:hmr'),
+  options: Debug('wilson:options'),
+  pages: Debug('wilson:pages'),
+  sources: Debug('wilson:sources'),
+}
 
 const transformJsx = (code) => {
   return transform(code, {
@@ -35,14 +45,10 @@ const toSlug = (string) => {
   return slugify(string, { lower: true, locale: 'en' })
 }
 
-const getShortName = (file, root) => {
-  return file.startsWith(root + '/') ? path.posix.relative(root, file) : file
-}
-
 const isPage = (filename) => {
   const extension = path.extname(filename)
   return (
-    filename.startsWith(pageDirectory) && pageExtensions.includes(extension)
+    filename.startsWith(pageDirectory) && PAGE_EXTENSIONS.includes(extension)
   )
 }
 
@@ -58,10 +64,6 @@ const isContentPage = (type) => {
   return type === 'content' || type === undefined
 }
 
-const readPagefiles = () => {
-  return klawSync(pageDirectory, { nodir: true })
-}
-
 const splitId = (id) => {
   const [filename, rawQuery] = id.split('?', 2)
   return { filename, rawQuery }
@@ -71,42 +73,40 @@ const hasIntersection = (arr1, arr2) => {
   return arr1.filter((v) => arr2.includes(v)).length > 0
 }
 
-const wrapLayout = (wrapped, layoutProps = {}) => {
-  return `import Layout from '${layoutPath}';const Wrapper=()=><Layout {...${JSON.stringify(
-    layoutProps
-  )}}>${wrapped}</Layout>;export default Wrapper;`
-}
-
-const getTaxonomyTerms = (taxonomyName) => {
-  return [
-    ...new Set(
-      Array.from(frontmatterCache.entries())
-        .map(([, fm]) => (fm.taxonomies ?? {})[taxonomyName] || [])
-        .flat()
-    ),
-  ]
-}
-
-const getContentPages = (filename, taxonomyName, terms) => {
-  const cacheKey = `${filename}:${terms.join(';')}`
+const getContentPages = (sources, taxonomyName, terms) => {
+  const cacheKey = `${taxonomyName}:${terms.join(';')}`
   if (!contentPagesCache.has(cacheKey)) {
     contentPagesCache.set(
       cacheKey,
-      Array.from(frontmatterCache.entries())
-        .map(([f, fm]) => {
-          return isContentPage(fm.type) &&
-            hasIntersection((fm.taxonomies ?? {})[taxonomyName] ?? [], terms)
-            ? { route: pagePathToRoute(f), frontmatter: fm }
+      Array.from(sources.entries())
+        .map(([absolutePath, { frontmatter }]) =>
+          isContentPage(frontmatter.type) &&
+          hasIntersection(
+            (frontmatter.taxonomies ?? {})[taxonomyName] ?? [],
+            terms
+          )
+            ? { route: pagePathToRoute(absolutePath), frontmatter }
             : null
-        })
+        )
         .filter(Boolean)
     )
   }
   return contentPagesCache.get(cacheKey)
 }
 
-const replaceTerm = (string, term) => {
-  return string.replace(/\${term}/, term)
+const replaceTerm = (string, term) => string.replace(/\[term\]/, term)
+
+/**
+ * transforms source frontmatter to page frontmatter
+ */
+const transformFrontmatter = (frontmatter, term) => {
+  const frontmatterCopy = { ...frontmatter }
+  delete frontmatterCopy.permalink
+
+  return {
+    ...frontmatterCopy,
+    title: term ? replaceTerm(frontmatter.title, term) : frontmatter.title,
+  }
 }
 
 const chunkArray = (array, size) => {
@@ -120,7 +120,7 @@ const chunkArray = (array, size) => {
 
 const pagePathToRoute = (pagePath) => {
   const relativePath = path.relative(pageDirectory, pagePath)
-  const extensionRegexp = new RegExp(`(${pageExtensions.join('|')})$`)
+  const extensionRegexp = new RegExp(`(${PAGE_EXTENSIONS.join('|')})$`)
   const withoutExtension = relativePath.replace(extensionRegexp, '')
   const withoutIndex = withoutExtension.replace(/\/?index$/, '')
   return `/${withoutIndex}/`.replace(/\/\//g, '/')
@@ -128,23 +128,6 @@ const pagePathToRoute = (pagePath) => {
 
 const createPaginatedRoute = (route, pageNumber) => {
   return `${route}${pageNumber === 1 ? '' : `page-${pageNumber}/`}`
-}
-
-const getFrontmatter = (filename, term = false) => {
-  if (!frontmatterCache.has(filename)) {
-    const code = fs.readFileSync(filename, 'utf-8')
-    const extension = path.extname(filename)
-    const parsed = parseFrontmatter(code, extension)
-    frontmatterCache.set(filename, parsed)
-  }
-  const frontmatter = frontmatterCache.get(filename)
-  return term
-    ? {
-        ...frontmatter,
-        title: replaceTerm(frontmatter.title, term),
-        permalink: replaceTerm(frontmatter.permalink, toSlug(term)),
-      }
-    : frontmatter
 }
 
 const createPagination = (baseRoute, currentPage, numPages) => {
@@ -155,86 +138,11 @@ const createPagination = (baseRoute, currentPage, numPages) => {
         ? undefined
         : createPaginatedRoute(baseRoute, currentPage - 1),
     nextPage:
-      currentPage === Math.ceil(numPages / pageSize)
+      numPages === 0 ||
+      currentPage === Math.ceil(numPages / PAGINATION_PAGE_SIZE)
         ? undefined
         : createPaginatedRoute(baseRoute, currentPage + 1),
   }
-}
-
-const getPageProps = (filename, queryString) => {
-  const { currentPage, selectedTerm } = parseQueryString(queryString)
-  const page = Number(currentPage)
-  const frontmatter = getFrontmatter(filename)
-  const props = { frontmatter }
-  const { taxonomyName, selectedTerms } = frontmatter
-
-  if (frontmatter.type === 'terms') {
-    props.terms = getTaxonomyTerms(taxonomyName).map((term) => ({
-      term,
-      slug: toSlug(term),
-    }))
-  } else if (frontmatter.type === 'select') {
-    const contentPages = getContentPages(filename, taxonomyName, selectedTerms)
-    props.pages = contentPages.slice((page - 1) * pageSize, page * pageSize)
-    props.pagination = createPagination(
-      pagePathToRoute(filename),
-      page,
-      contentPages.length
-    )
-  } else if (frontmatter.type === 'taxonomy') {
-    const contentPages = getContentPages(filename, taxonomyName, [selectedTerm])
-    props.frontmatter = getFrontmatter(filename, selectedTerm)
-    props.pages = contentPages.slice((page - 1) * pageSize, page * pageSize)
-    props.pagination = createPagination(
-      props.frontmatter.permalink,
-      page,
-      contentPages.length
-    )
-  }
-
-  return props
-}
-
-const getRoutes = () => {
-  let routes = []
-
-  readPagefiles().forEach(({ path: pagePath }) => {
-    const fm = getFrontmatter(pagePath)
-    const getChunkedContentPages = (terms) =>
-      chunkArray(getContentPages(pagePath, fm.taxonomyName, terms), pageSize)
-
-    if (fm.type === 'taxonomy') {
-      getTaxonomyTerms(fm.taxonomyName).forEach((term) => {
-        const contentPages = getChunkedContentPages([term])
-        contentPages.forEach((_, i) => {
-          const queryString = stringifyQuery({
-            selectedTerm: term,
-            currentPage: i + 1,
-          })
-          routes.push({
-            module: `${pagePath}?${queryString}`,
-            path: createPaginatedRoute(
-              replaceTerm(fm.permalink, toSlug(term)),
-              i + 1
-            ),
-          })
-        })
-      })
-    } else if (fm.type === 'select') {
-      const contentPages = getChunkedContentPages(fm.selectedTerms)
-      contentPages.forEach((_, i) => {
-        const queryString = stringifyQuery({ currentPage: i + 1 })
-        routes.push({
-          module: `${pagePath}?${queryString}`,
-          path: createPaginatedRoute(pagePathToRoute(pagePath), i + 1),
-        })
-      })
-    } else {
-      routes.push({ module: pagePath, path: pagePathToRoute(pagePath) })
-    }
-  })
-
-  return routes
 }
 
 const parseFrontmatter = (code, extension) => {
@@ -278,6 +186,287 @@ const parseFrontmatter = (code, extension) => {
   }
 }
 
+const resolveOptions = (root) => {
+  const configName = 'wilson.config.js'
+  const configPath = path.resolve(root, configName)
+  const hasConfig = fs.existsSync(configPath)
+  const require = createRequire(import.meta.url)
+  const defaults = {}
+  const config = hasConfig ? require(configPath) : {}
+  return { ...defaults, ...config, root }
+}
+
+// =====================================================
+// SOURCES
+// =====================================================
+
+const resolveSources = (options) => {
+  const sourcesDir = 'src/pages'
+  const sources = new Map()
+  const pagePath = path.resolve(options.root, sourcesDir)
+  const ext = `{${PAGE_EXTENSIONS.join(',')}}`
+  const files = fg.sync(`**/*${ext}`, {
+    onlyFiles: true,
+    cwd: pagePath,
+  })
+
+  files.forEach((pagePath) => {
+    const relativePath = path.join(sourcesDir, pagePath)
+    const absolutePath = path.resolve(options.root, relativePath)
+    const extension = path.extname(pagePath)
+    const sourceCode = fs.readFileSync(absolutePath, 'utf-8')
+    const frontmatter = parseFrontmatter(sourceCode, extension)
+
+    sources.set(absolutePath, {
+      extension,
+      absolutePath,
+      relativePath,
+      pagePath,
+      // sourceCode,
+      frontmatter,
+    })
+  })
+
+  return sources
+}
+
+const getTaxonomyTerms = (sources, taxonomyName) => {
+  const sourceArray = Array.from(sources.values())
+  const termSet = new Set(
+    sourceArray
+      .map((source) => {
+        const taxonomies = source.frontmatter.taxonomies ?? {}
+        return taxonomies[taxonomyName] ?? []
+      })
+      .flat()
+  )
+  return [...termSet]
+}
+
+// =====================================================
+// PAGES
+// =====================================================
+
+const getPage = (pages, sourcePath, queryString) => {
+  return pages.get(queryString ? `${sourcePath}?${queryString}` : sourcePath)
+}
+
+const getPageProps = (pages, sourcePath, queryString) => {
+  return getPage(pages, sourcePath, queryString).props
+}
+
+const updateSource = (sources, sourcePath, frontmatter) => {
+  const source = sources.get(sourcePath)
+  sources.delete(sourcePath)
+  source.frontmatter = frontmatter
+  sources.set(sourcePath, source)
+  return source
+}
+
+const updateSourcePages = (pages, sources, source) => {
+  deleteSourcePages(pages, source)
+  addSourcePages(pages, sources, source)
+}
+
+const deleteSourcePages = (pages, source) => {
+  Array.from(pages.entries()).forEach(([key, page]) => {
+    if (page.sourcePath === source.absolutePath) {
+      pages.delete(key)
+    }
+  })
+}
+
+const addSelectSourcePages = (sources, source, pages) => {
+  const {
+    absolutePath,
+    frontmatter: { selectedTerms, taxonomyName },
+  } = source
+
+  const taxonomyPages = getContentPages(sources, taxonomyName, selectedTerms)
+  const chunkedPages = chunkArray(taxonomyPages, PAGINATION_PAGE_SIZE)
+  if (chunkedPages.length === 0) chunkedPages.push([])
+
+  chunkedPages.forEach((contentPages, i) => {
+    const page = i + 1
+    const query = { page }
+    const queryString = stringifyQuery(query)
+    const baseRoute = pagePathToRoute(absolutePath)
+    const route = createPaginatedRoute(baseRoute, page)
+    const frontmatter = transformFrontmatter(source.frontmatter)
+    const pagination = createPagination(baseRoute, page, taxonomyPages.length)
+    pages.set(`${absolutePath}?${queryString}`, {
+      route,
+      sourcePath: absolutePath,
+      query,
+      queryString,
+      props: { frontmatter, pages: contentPages, pagination },
+    })
+  })
+}
+
+const addTaxonomySourcePages = (sources, source, pages) => {
+  const {
+    absolutePath,
+    frontmatter: { taxonomyName },
+  } = source
+
+  getTaxonomyTerms(sources, taxonomyName).forEach((term) => {
+    const taxonomyPages = getContentPages(sources, taxonomyName, [term])
+    const chunkedPages = chunkArray(taxonomyPages, PAGINATION_PAGE_SIZE)
+    if (chunkedPages.length === 0) chunkedPages.push([])
+
+    chunkedPages.forEach((contentPages, i) => {
+      const page = i + 1
+      const query = { selectedTerm: term, page }
+      const queryString = stringifyQuery(query)
+      const baseRoute = replaceTerm(source.frontmatter.permalink, toSlug(term))
+      const route = createPaginatedRoute(baseRoute, page)
+      const frontmatter = transformFrontmatter(source.frontmatter, term)
+      const pagination = createPagination(baseRoute, page, taxonomyPages.length)
+      pages.set(`${absolutePath}?${queryString}`, {
+        route,
+        sourcePath: absolutePath,
+        query,
+        queryString,
+        props: { frontmatter, pages: contentPages, term, pagination },
+      })
+    })
+  })
+}
+
+const addSourcePages = (pages, sources, source) => {
+  if (source.frontmatter.type === 'taxonomy') {
+    addTaxonomySourcePages(sources, source, pages)
+  } else if (source.frontmatter.type === 'select') {
+    addSelectSourcePages(sources, source, pages)
+  } else {
+    const route = pagePathToRoute(source.absolutePath)
+    const frontmatter = transformFrontmatter(source.frontmatter)
+    const props = { frontmatter }
+    if (source.frontmatter.type === 'terms') {
+      props.terms = getTaxonomyTerms(
+        sources,
+        source.frontmatter.taxonomyName
+      ).map((term) => ({
+        term,
+        slug: toSlug(term),
+      }))
+    }
+    pages.set(source.absolutePath, {
+      route,
+      sourcePath: source.absolutePath,
+      props,
+    })
+  }
+}
+
+const resolvePages = (sources) => {
+  const pages = new Map()
+
+  sources.forEach((source) => {
+    addSourcePages(pages, sources, source)
+  })
+
+  return pages
+}
+
+// =====================================================
+// PLUGIN
+// =====================================================
+
+const wilsonPlugin = () => {
+  let options
+  let sources
+  let pages
+
+  return {
+    name: 'vite-plugin-wilson',
+    enforce: 'pre',
+    configResolved({ root }) {
+      options = resolveOptions(root)
+      debug.options(options)
+      sources = resolveSources(options)
+      debug.sources(sources)
+      pages = resolvePages(sources)
+      debug.pages(pages)
+    },
+    async handleHotUpdate(ctx) {
+      const { filename } = splitId(ctx.file)
+      if (isPage(filename)) {
+        const content = await ctx.read(ctx.file)
+        if (content === hotUpdateCache.get(ctx.file)) return
+        hotUpdateCache.set(ctx.file, content)
+        const frontmatter = parseFrontmatter(content, path.extname(ctx.file))
+        const updatedSource = updateSource(sources, ctx.file, frontmatter)
+        updateSourcePages(pages, sources, updatedSource)
+        return ctx.modules
+      }
+    },
+    resolveId(id) {
+      if (id === MODULE_ID_VIRTUAL) {
+        return id
+      }
+    },
+    async load(id) {
+      if (id === MODULE_ID_VIRTUAL) {
+        const pageValues = Array.from(pages.values())
+        const code = `
+          import { h } from 'preact';
+          import { lazy } from 'preact-iso';
+          ${pageValues
+            .map(({ sourcePath, query }, i) => {
+              return `const Page_${i} = lazy(() => import('${sourcePath}${
+                query ? `?${stringifyQuery(query)}` : ''
+              }'));`
+            })
+            .join('')}
+          export default [${pageValues
+            .map(({ route }, i) => {
+              return `h(Page_${i},{path:'${route}'})`
+            })
+            .join(',')}];
+        `
+        return code
+      }
+    },
+    transform(code, id) {
+      const { filename, rawQuery } = splitId(id)
+
+      if (isPage(filename)) {
+        let jsx
+
+        if (isMarkdownPage(filename)) {
+          const { content } = grayMatter(code)
+          const html = md.render(content.replace(/^\n/, '').replace(/\n$/, ''))
+          const props = { frontmatter: sources.get(filename).frontmatter }
+          jsx = `
+            import {h,Fragment} from "preact";
+            import Layout from '${layoutPath}';
+            const props=${JSON.stringify(props)};
+            const Wrapper = () => <Layout {...props}>${html}</Layout>;
+            export default Wrapper;
+          `
+        } else if (isJavascriptPage(filename)) {
+          const props = getPageProps(pages, filename, rawQuery)
+          jsx = `
+            ${code}
+            import Layout from '${layoutPath}';
+            const props=${JSON.stringify(props)};
+            const Wrapper = () => <Layout {...props}><Page {...props} /></Layout>;
+            export default Wrapper;
+          `
+        }
+
+        return transformJsx(jsx)
+      }
+    },
+  }
+}
+
+// =====================================================
+// VITE
+// =====================================================
+
 export default defineConfig({
   clearScreen: false,
   esbuild: {
@@ -285,97 +474,5 @@ export default defineConfig({
     jsxFactory: 'h',
     jsxFragment: 'Fragment',
   },
-  plugins: [
-    {
-      name: 'routes',
-      resolveId(id) {
-        return id.startsWith('virtual:routes') ? id : undefined
-      },
-      async load(id) {
-        if (!id.startsWith('virtual:routes')) return
-        const routes = getRoutes()
-        const code = `
-          import { h } from 'preact';
-          import { lazy } from 'preact-iso';
-          ${routes
-            .map(
-              ({ module }, i) =>
-                `const Page_${i} = lazy(() => import('${module}'));`
-            )
-            .join('')}
-          export default [${routes
-            .map(({ path }, i) => `h(Page_${i},{path:'${path}'})`)
-            .join(',')}];
-        `
-        return code
-      },
-    },
-    {
-      name: 'md-pages',
-      async handleHotUpdate(ctx) {
-        const { filename } = splitId(ctx.file)
-        if (isMarkdownPage(filename)) {
-          const content = await ctx.read(ctx.file)
-          if (content === hotUpdateCache.get(ctx.file)) return
-          const frontmatter = parseFrontmatter(content, '.md')
-          frontmatterCache.set(ctx.file, frontmatter)
-          hotUpdateCache.set(ctx.file, content)
-          return ctx.modules
-        }
-      },
-      transform(code, id) {
-        const { filename } = splitId(id)
-        if (isMarkdownPage(filename)) {
-          const { content } = grayMatter(code)
-          const html = md.render(content.replace(/^\n/, '').replace(/\n$/, ''))
-          const frontmatter = getFrontmatter(filename)
-          const jsx = `import {h,Fragment} from "preact";const Page=()=>(<>${html}</>);${wrapLayout(
-            `<Page frontmatter={${JSON.stringify(frontmatter)}}/>`,
-            { frontmatter }
-          )}`
-          const preact = transformJsx(jsx)
-          return preact
-        }
-      },
-    },
-    {
-      name: 'js-pages',
-      async handleHotUpdate(ctx) {
-        const { filename } = splitId(ctx.file)
-        if (isJavascriptPage(filename)) {
-          const content = await ctx.read(ctx.file)
-          if (content !== hotUpdateCache.get(ctx.file)) {
-            const frontmatter = parseFrontmatter(content, '.jsx')
-            frontmatterCache.set(ctx.file, frontmatter)
-            hotUpdateCache.set(ctx.file, content)
-          }
-          return ctx.modules
-        }
-      },
-      transform(code, id) {
-        const { filename, rawQuery } = splitId(id)
-        if (isJavascriptPage(filename)) {
-          const props = getPageProps(filename, rawQuery)
-          const jsx = `${code}const props=${JSON.stringify(props)};${wrapLayout(
-            `<Page {...props} />`,
-            props
-          )}`
-          const preact = transformJsx(jsx)
-          return preact
-        }
-      },
-    },
-    {
-      name: 'frontmatter',
-      async configResolved() {
-        for (const { path: pagePath } of readPagefiles()) {
-          const code = fs.readFileSync(pagePath, 'utf-8')
-          const extension = path.extname(pagePath)
-          const frontmatter = parseFrontmatter(code, extension)
-          frontmatterCache.set(pagePath, frontmatter)
-        }
-      },
-    },
-    preact,
-  ],
+  plugins: [wilsonPlugin(), preact],
 })
