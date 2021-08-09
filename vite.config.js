@@ -1,5 +1,6 @@
 import fs from 'fs'
 import path from 'path'
+import crypto from 'crypto'
 import { createRequire } from 'module'
 
 import { defineConfig } from 'vite'
@@ -13,6 +14,7 @@ import { stringify as stringifyQuery } from 'qs'
 import { parse as parseJavaScript } from 'acorn'
 import { generate } from 'astring'
 import slugify from 'slugify'
+import chalk from 'chalk'
 import fg from 'fast-glob'
 
 const PAGE_EXTENSIONS = ['.jsx', '.md']
@@ -20,12 +22,12 @@ const PAGINATION_PAGE_SIZE = 2
 const MODULE_ID_VIRTUAL = 'virtual:routes'
 
 const md = new MarkdownIt()
-const hotUpdateCache = new Map()
-const contentPagesCache = new Map()
+const frontmatterCache = new Map()
 const pageDirectory = path.join(process.cwd(), 'src', 'pages')
 const layoutPath = path.join(process.cwd(), 'src', 'layouts', 'page.jsx')
 
 const debug = {
+  frontmatter: Debug('wilson:frontmatter'),
   hmr: Debug('wilson:hmr'),
   options: Debug('wilson:options'),
   pages: Debug('wilson:pages'),
@@ -74,24 +76,14 @@ const hasIntersection = (arr1, arr2) => {
 }
 
 const getContentPages = (sources, taxonomyName, terms) => {
-  const cacheKey = `${taxonomyName}:${terms.join(';')}`
-  if (!contentPagesCache.has(cacheKey)) {
-    contentPagesCache.set(
-      cacheKey,
-      Array.from(sources.entries())
-        .map(([absolutePath, { frontmatter }]) =>
-          isContentPage(frontmatter.type) &&
-          hasIntersection(
-            (frontmatter.taxonomies ?? {})[taxonomyName] ?? [],
-            terms
-          )
-            ? { route: pagePathToRoute(absolutePath), frontmatter }
-            : null
-        )
-        .filter(Boolean)
+  return Array.from(sources.entries())
+    .map(([absolutePath, { frontmatter }]) =>
+      isContentPage(frontmatter.type) &&
+      hasIntersection((frontmatter.taxonomies ?? {})[taxonomyName] ?? [], terms)
+        ? { route: pagePathToRoute(absolutePath), frontmatter }
+        : null
     )
-  }
-  return contentPagesCache.get(cacheKey)
+    .filter(Boolean)
 }
 
 const replaceTerm = (string, term) => string.replace(/\[term\]/, term)
@@ -145,48 +137,116 @@ const createPagination = (baseRoute, currentPage, numPages) => {
   }
 }
 
-const parseFrontmatter = (code, extension) => {
-  if (extension === '.md') {
-    return grayMatter(code).data
-  } else if (extension === '.jsx') {
-    const js = transformJsx(code)
-    const ast = parseJavaScript(js, {
-      ecmaVersion: 'latest',
-      sourceType: 'module',
-    })
-    let frontmatterNode = null
-    walk(ast, {
-      enter(node) {
-        if (node.type !== 'ExportNamedDeclaration') return
-        if (
-          node.declaration.type !== 'VariableDeclaration' ||
-          node.declaration.kind !== 'const'
-        )
-          return
-        if (node.declaration.declarations.length !== 1) return
-        const declarator = node.declaration.declarations[0]
-        if (declarator.type !== 'VariableDeclarator') return
-        if (
-          declarator.id.type !== 'Identifier' ||
-          declarator.id.name !== 'frontmatter'
-        )
-          return
-        if (declarator.init.type !== 'ObjectExpression') return
-        frontmatterNode = declarator.init
-      },
-    })
-    const objSource = frontmatterNode
-      ? generate(frontmatterNode, { indent: '', lineEnd: '' })
-      : '{}'
-    const data = {
-      // eslint-disable-next-line
-      ...(0, eval)(`const obj=()=>(${objSource});obj`)(),
-    }
-    return data
-  }
+// =====================================================
+// FRONTMATTER
+// =====================================================
+
+/**
+ * Parses markdown frontmatter
+ *
+ * @param {string} markdownString - Markdown string
+ */
+const parseMarkdownFrontmatter = (markdownString) => {
+  return grayMatter(markdownString).data
 }
 
-const resolveOptions = (root) => {
+/**
+ * Parses javascript frontmatter
+ *
+ * @param {string} javascriptString - JavaScript string
+ */
+const parseJavascriptFrontmatter = (javascriptString) => {
+  const js = transformJsx(javascriptString)
+  const ast = parseJavaScript(js, {
+    ecmaVersion: 'latest',
+    sourceType: 'module',
+  })
+  let frontmatterNode = null
+  walk(ast, {
+    enter(node) {
+      if (node.type !== 'ExportNamedDeclaration') return
+      if (
+        node.declaration.type !== 'VariableDeclaration' ||
+        node.declaration.kind !== 'const'
+      )
+        return
+      if (node.declaration.declarations.length !== 1) return
+      const declarator = node.declaration.declarations[0]
+      if (declarator.type !== 'VariableDeclarator') return
+      if (
+        declarator.id.type !== 'Identifier' ||
+        declarator.id.name !== 'frontmatter'
+      )
+        return
+      if (declarator.init.type !== 'ObjectExpression') return
+      frontmatterNode = declarator.init
+    },
+  })
+  const objSource = frontmatterNode
+    ? generate(frontmatterNode, { indent: '', lineEnd: '' })
+    : '{}'
+  const data = {
+    // eslint-disable-next-line
+    ...(0, eval)(`const obj=()=>(${objSource});obj`)(),
+  }
+  return data
+}
+
+/**
+ * Returns frontmatter for page
+ *
+ * @param {string} absolutePath - Absolute path to page.
+ */
+const getFrontmatter = (absolutePath) => {
+  if (!isPage(absolutePath)) {
+    throw new Error(`${absolutePath} is not a page`)
+  }
+
+  const content = fs.readFileSync(absolutePath, 'utf8')
+  const contentHash = crypto.createHash('md5').update(content).digest('hex')
+
+  if (frontmatterCache.has(contentHash)) {
+    return frontmatterCache.get(contentHash)
+  }
+
+  let frontmatter
+  if (path.extname(absolutePath) === '.md') {
+    frontmatter = parseMarkdownFrontmatter(content)
+  } else {
+    frontmatter = parseJavascriptFrontmatter(content)
+  }
+
+  debug.frontmatter(
+    'parsing frontmatter %s',
+    path.relative(process.cwd(), absolutePath)
+  )
+  frontmatterCache.set(contentHash, frontmatter)
+  return frontmatter
+}
+
+// =====================================================
+// UTIL
+// =====================================================
+
+/**
+ * Creates a duplicate-free version of an array
+ *
+ * @param {array} array - The array to inspect
+ */
+const unique = (array) => {
+  return [...new Set(array)]
+}
+
+// =====================================================
+// OPTIONS
+// =====================================================
+
+/**
+ * Returns wilson options.
+ *
+ * @param {string} root - Root directory path
+ */
+const getOptions = (root = process.cwd()) => {
   const configName = 'wilson.config.js'
   const configPath = path.resolve(root, configName)
   const hasConfig = fs.existsSync(configPath)
@@ -214,15 +274,13 @@ const resolveSources = (options) => {
     const relativePath = path.join(sourcesDir, pagePath)
     const absolutePath = path.resolve(options.root, relativePath)
     const extension = path.extname(pagePath)
-    const sourceCode = fs.readFileSync(absolutePath, 'utf-8')
-    const frontmatter = parseFrontmatter(sourceCode, extension)
+    const frontmatter = getFrontmatter(absolutePath)
 
     sources.set(absolutePath, {
       extension,
       absolutePath,
       relativePath,
       pagePath,
-      // sourceCode,
       frontmatter,
     })
   })
@@ -230,9 +288,31 @@ const resolveSources = (options) => {
   return sources
 }
 
+const updateSource = (sources, sourcePath, frontmatter) => {
+  const source = sources.get(sourcePath)
+  sources.delete(sourcePath)
+  source.frontmatter = frontmatter
+  sources.set(sourcePath, source)
+  return source
+}
+
+const getTaxonomyDependencies = (sources, taxonomies) => {
+  return Array.from(sources.values())
+    .map(({ absolutePath, frontmatter }) => {
+      const { taxonomyName, type, selectedTerms } = frontmatter
+      const isTaxonomyTarget =
+        type === 'taxonomy' && Array.isArray(taxonomies[taxonomyName])
+      const isSelectTarget =
+        type === 'select' &&
+        hasIntersection(taxonomies[taxonomyName] ?? [], selectedTerms)
+      return isTaxonomyTarget || isSelectTarget ? absolutePath : false
+    })
+    .filter(Boolean)
+}
+
 const getTaxonomyTerms = (sources, taxonomyName) => {
   const sourceArray = Array.from(sources.values())
-  const termSet = new Set(
+  const terms = unique(
     sourceArray
       .map((source) => {
         const taxonomies = source.frontmatter.taxonomies ?? {}
@@ -240,7 +320,7 @@ const getTaxonomyTerms = (sources, taxonomyName) => {
       })
       .flat()
   )
-  return [...termSet]
+  return terms
 }
 
 // =====================================================
@@ -255,15 +335,8 @@ const getPageProps = (pages, sourcePath, queryString) => {
   return getPage(pages, sourcePath, queryString).props
 }
 
-const updateSource = (sources, sourcePath, frontmatter) => {
-  const source = sources.get(sourcePath)
-  sources.delete(sourcePath)
-  source.frontmatter = frontmatter
-  sources.set(sourcePath, source)
-  return source
-}
-
 const updateSourcePages = (pages, sources, source) => {
+  debug.hmr(`updating ${chalk.green('%s')}`, source.relativePath)
   deleteSourcePages(pages, source)
   addSourcePages(pages, sources, source)
 }
@@ -371,36 +444,86 @@ const resolvePages = (sources) => {
 }
 
 // =====================================================
+// HMR
+// =====================================================
+
+/**
+ * Handles hot updates
+ *
+ * @param {string} file - The path of the updated file
+ * @param {ModuleNode[]} modules - The array of affected module nodes
+ * @param {ModuleGraph} moduleGraph - The module graph
+ */
+const handleHotUpdate = (file, modules, moduleGraph, sources, pages) => {
+  const { filename } = splitId(file)
+
+  if (!isPage(filename)) {
+    return
+  }
+
+  const moduleNodes = [...modules]
+  const frontmatter = getFrontmatter(filename)
+
+  if (isContentPage()) {
+    const relatedTaxonomies = mergeTaxonomyValues(
+      frontmatter.taxonomies,
+      sources.get(filename).frontmatter.taxonomies
+    )
+    const dependencies = getTaxonomyDependencies(sources, relatedTaxonomies)
+    dependencies.forEach((dependency) => {
+      moduleNodes.push(
+        ...Array.from(moduleGraph.fileToModulesMap.get(dependency) ?? [])
+      )
+    })
+  }
+
+  const sourcesToUpdate = unique(moduleNodes.map(({ file }) => file))
+  sourcesToUpdate.forEach((sourcePath) => {
+    const frontmatter = getFrontmatter(sourcePath)
+    const updatedSource = updateSource(sources, sourcePath, frontmatter)
+    updateSourcePages(pages, sources, updatedSource)
+  })
+
+  return moduleNodes
+}
+
+/**
+ * Merges taxonomy values
+ *
+ * @param {Array} taxonomies1 - First taxonomies
+ * @param {Array} taxonomies2 - Second taxonomies
+ */
+const mergeTaxonomyValues = (taxonomies1, taxonomies2) => {
+  const result = {}
+  Object.keys(taxonomies1).map((key) => {
+    result[key] = taxonomies1[key]
+  })
+  Object.keys(taxonomies2).map((key) => {
+    result[key] = unique([...(result[key] ?? []), ...taxonomies2[key]])
+  })
+  return result
+}
+
+// =====================================================
 // PLUGIN
 // =====================================================
 
 const wilsonPlugin = () => {
-  let options
-  let sources
-  let pages
+  let options, sources, pages
 
   return {
     name: 'vite-plugin-wilson',
     enforce: 'pre',
     configResolved({ root }) {
-      options = resolveOptions(root)
+      options = getOptions(root)
       debug.options(options)
       sources = resolveSources(options)
       debug.sources(sources)
       pages = resolvePages(sources)
       debug.pages(pages)
     },
-    async handleHotUpdate(ctx) {
-      const { filename } = splitId(ctx.file)
-      if (isPage(filename)) {
-        const content = await ctx.read(ctx.file)
-        if (content === hotUpdateCache.get(ctx.file)) return
-        hotUpdateCache.set(ctx.file, content)
-        const frontmatter = parseFrontmatter(content, path.extname(ctx.file))
-        const updatedSource = updateSource(sources, ctx.file, frontmatter)
-        updateSourcePages(pages, sources, updatedSource)
-        return ctx.modules
-      }
+    async handleHotUpdate({ file, modules, server: { moduleGraph } }) {
+      return handleHotUpdate(file, modules, moduleGraph, sources, pages)
     },
     resolveId(id) {
       if (id === MODULE_ID_VIRTUAL) {
@@ -474,5 +597,6 @@ export default defineConfig({
     jsxFactory: 'h',
     jsxFragment: 'Fragment',
   },
+  logLevel: 'silent',
   plugins: [wilsonPlugin(), preact],
 })
